@@ -1,0 +1,8 @@
+[submodule "hyperturtle-linux/src"]
+	path = hyperturtle-linux/src
+	url  = https://github.com/OriBenZur/hyperturtle-linux.git
+	branch = nestedVirt-HUC
+
+[submodule "hyperturtle-qemu/src"]
+	path = hyperturtle-qemu/src
+	url  = https://github.com/OriBenZur/hyperturtle-qemu.git
