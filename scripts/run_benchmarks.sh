@@ -67,24 +67,36 @@ EOF
     echo "$bin"
 }
 
-# x86 only: CPU cycle counter via RDTSC
+# x86 only: RDTSC cycle counter + vmcall helper for baseline measurements.
+# vmcall causes a real VM exit — exactly what the paper's "VM baseline" measures.
 RDTSC_SNIPPET='
 static inline unsigned long long rdtsc(void) {
     unsigned int lo, hi;
     __asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
     return ((unsigned long long)hi << 32) | lo;
 }
+
+/* Issue a single vmcall with hypercall number nr and up to 3 arguments.
+   On stock KVM/QEMU this causes a VM exit; the return value may be -ENOSYS
+   (unknown hypercall) — that is fine, we only care about the round-trip cost. */
+static inline long do_vmcall(long nr, long a1, long a2, long a3) {
+    long ret;
+    __asm__ __volatile__ ("vmcall"
+        : "=a" (ret)
+        : "a" (nr), "b" (a1), "c" (a2), "d" (a3)
+        : "memory");
+    return ret;
+}
 '
 
 # ─── 1. hypercall: raw vmcall round-trip latency ─────────────────────────────
 bench_hypercall() {
     if [[ "$MODE" == "baseline" ]]; then
-        log "=== hypercall [baseline]: getpid() round-trip latency ($ITERS iterations) ==="
+        log "=== hypercall [baseline]: vmcall#13 (load) VM-exit round-trip ($ITERS iterations) ==="
         local bin
         bin=$(compile_driver_baseline "hypercall" "
 #include <stdio.h>
 #include <stdint.h>
-#include <unistd.h>
 
 $RDTSC_SNIPPET
 
@@ -94,11 +106,11 @@ int main(void) {
     unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long t0 = rdtsc();
-        (void) getpid();
+        do_vmcall(13, 0, 0, 0);   /* hyperupcall load vmcall — VM exit to QEMU */
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
-    printf(\"hypercall [baseline] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
+    printf(\"hypercall [baseline] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
     return 0;
 }
 ")
@@ -139,29 +151,26 @@ int main(void) {
 # ─── 2. devnotify: XDP attach → device notification latency ──────────────────
 bench_devnotify() {
     if [[ "$MODE" == "baseline" ]]; then
-        log "=== devnotify [baseline]: socket+close round-trip latency ($ITERS iterations) ==="
+        log "=== devnotify [baseline]: vmcall#15 (link/XDP) VM-exit round-trip ($ITERS iterations) ==="
         local bin
         bin=$(compile_driver_baseline "devnotify" "
 #include <stdio.h>
 #include <stdint.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 
 $RDTSC_SNIPPET
 
-#define ITERS $ITERS
+#define ITERS   $ITERS
+#define NETDEV  $NETDEV
 
 int main(void) {
     unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long t0 = rdtsc();
-        int fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (fd >= 0) close(fd);
+        do_vmcall(15, 0, 0, NETDEV);  /* hyperupcall link vmcall (XDP) — VM exit to QEMU */
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
-    printf(\"devnotify [baseline] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
+    printf(\"devnotify [baseline] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
     return 0;
 }
 ")
@@ -207,12 +216,11 @@ int main(void) {
 # ─── 3. sendipi: perf-event hyperupcall → IPI delivery latency ───────────────
 bench_sendipi() {
     if [[ "$MODE" == "baseline" ]]; then
-        log "=== sendipi [baseline]: getpid() round-trip latency ($ITERS iterations) ==="
+        log "=== sendipi [baseline]: vmcall#15 (link/perf) VM-exit round-trip ($ITERS iterations) ==="
         local bin
         bin=$(compile_driver_baseline "sendipi" "
 #include <stdio.h>
 #include <stdint.h>
-#include <unistd.h>
 
 $RDTSC_SNIPPET
 
@@ -222,11 +230,11 @@ int main(void) {
     unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long t0 = rdtsc();
-        (void) getpid();
+        do_vmcall(15, 0, 1, 1);   /* hyperupcall link vmcall (perf/profiling) — VM exit to QEMU */
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
-    printf(\"sendipi [baseline] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
+    printf(\"sendipi [baseline] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
     return 0;
 }
 ")
@@ -277,7 +285,6 @@ bench_program_timer() {
         bin=$(compile_driver_baseline "program_timer" "
 #include <stdio.h>
 #include <stdint.h>
-#include <unistd.h>
 
 $RDTSC_SNIPPET
 
@@ -285,22 +292,20 @@ $RDTSC_SNIPPET
 #define DURATION_S  5
 
 int main(void) {
-    unsigned long long t_start = rdtsc();
     long long n = (long long)SAMPLE_FREQ * DURATION_S;
-    printf(\"ProgramTimer [baseline]: %lld getpid() calls (equiv %d Hz * %ds)...\\n\",
+    printf(\"ProgramTimer [baseline]: %lld vmcall#19 (timer) VM-exits (equiv %d Hz * %ds)...\\n\",
            (long long)n, SAMPLE_FREQ, DURATION_S);
     unsigned long long sum_cycles = 0;
+    unsigned long long t_start = rdtsc();
     for (long long i = 0; i < n; i++) {
         unsigned long long t0 = rdtsc();
-        (void) getpid();
+        do_vmcall(19, 0, SAMPLE_FREQ, 0);  /* hyperupcall map vmcall (timer/profiling) */
         unsigned long long t1 = rdtsc();
         sum_cycles += (t1 - t0);
     }
-    unsigned long long t_end = rdtsc();
-    unsigned long long total_cycles = t_end - t_start;
-    printf(\"ProgramTimer [baseline]: total %llu %s, avg %llu %s/call\\n\",
-           (unsigned long long)total_cycles, \"cycles\",
-           (unsigned long long)(sum_cycles / n), \"cycles\");
+    unsigned long long total_cycles = rdtsc() - t_start;
+    printf(\"ProgramTimer [baseline]: total %llu cycles, avg %llu cycles/call\\n\",
+           (unsigned long long)total_cycles, (unsigned long long)(sum_cycles / n));
     return 0;
 }
 ")
