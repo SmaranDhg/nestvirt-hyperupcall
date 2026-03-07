@@ -1,402 +1,109 @@
 #!/usr/bin/env bash
-# scripts/run_benchmarks.sh — Run the four L2→L0 hyperupcall micro-benchmarks.
-#
-# Benchmarks (from TODO.md):
-#   1. hypercall      – raw vmcall round-trip latency (load + unload an empty BPF object)
-#   2. devnotify      – device-notification latency via XDP hyperupcall
-#   3. sendipi        – inter-processor interrupt delivery latency via perf-event hyperupcall
-#   4. ProgramTimer   – periodic timer hyperupcall via profiling (perf) event
-#
-# Modes:
-#   baseline    – traditional path for each benchmark (no eBPF/hyperupcall):
-#                   hypercall    → vmcall(KVM_HC_SCHED_YIELD=11)  KVM in-kernel round-trip
-#                   devnotify    → eventfd write+read              QEMU device-notify path
-#                   sendipi      → vmcall(15) QEMU-exit round-trip IPI-request vmcall path
-#                   ProgramTimer → vmcall(19) QEMU-exit round-trip timer-request vmcall path
-#   hyperupcall – requires hyperturtle kernel + BPF objects; uses load/link hyperupcalls.
-#
-# Target: x86 only. Latency is reported in CPU cycles (RDTSC).
+# scripts/run_benchmarks.sh — Build and run the four kernel-module benchmarks.
 #
 # Usage:
-#   ./scripts/run_benchmarks.sh [all|hypercall|devnotify|sendipi|ProgramTimer]
-#   MODE=baseline ./scripts/run_benchmarks.sh all    # run baseline first to verify script
-#   MODE=hyperupcall ./scripts/run_benchmarks.sh all
-#   ITERS=10000 NETDEV=2 ./scripts/run_benchmarks.sh all
+#   sudo ./scripts/run_benchmarks.sh [all|hypercall|devnotify|sendipi|program_timer]
+#   sudo ITERS=10000 ./scripts/run_benchmarks.sh all
+#   sudo TARGET_CPU=2 ./scripts/run_benchmarks.sh sendipi
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HUC="$REPO_ROOT/hyperupcalls"
+KBENCH="$REPO_ROOT/kernel_benchmarks"
 
-# ─── Parameters (override via environment) ────────────────────────────────────
-ITERS="${ITERS:-1000}"          # number of iterations per benchmark
-NETDEV="${NETDEV:-2}"           # guest virtio-net interface index for XDP/TC
-SAMPLE_FREQ="${SAMPLE_FREQ:-1000}"  # Hz for ProgramTimer / profiling benchmark
-MODE="${MODE:-baseline}"        # baseline | hyperupcall
-RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/$(date +%Y%m%d_%H%M%S)_$MODE}"
-
+ITERS="${ITERS:-1000}"
+TARGET_CPU="${TARGET_CPU:-1}"
+PERIOD_NS="${PERIOD_NS:-1000000}"
+RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/$(date +%Y%m%d_%H%M%S)}"
 BENCH="${1:-all}"
 
-log()  { echo "[bench] $*"; }
 mkdir -p "$RESULTS_DIR"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Benchmark helpers
-# ─────────────────────────────────────────────────────────────────────────────
+log() { echo "[bench] $*"; }
 
-# Hyperupcall mode: compile driver that links hyperupcall.c
-compile_driver() {
-    local name="$1"
-    local src="$RESULTS_DIR/${name}_driver.c"
-    local bin="$RESULTS_DIR/${name}_driver"
-    cat > "$src" << EOF
-$2
-EOF
-    gcc -O2 -o "$bin" "$src" \
-        -I"$HUC" \
-        "$HUC/hyperupcall.c" \
-        -lpthread
-    echo "$bin"
+# ─── Build a kernel module ───────────────────────────────────────────────────
+build_module() {
+    local dir="$1"
+    log "Building $dir ..."
+    make -C "$KBENCH/$dir" 2>&1 | tail -1
 }
 
-# Baseline mode: compile standalone C (no hyperupcall lib or BPF)
-compile_driver_baseline() {
-    local name="$1"
-    local src="$RESULTS_DIR/${name}_driver.c"
-    local bin="$RESULTS_DIR/${name}_driver"
-    cat > "$src" << EOF
-$2
-EOF
-    gcc -O2 -Wno-unused-result -o "$bin" "$src"
-    echo "$bin"
+# ─── Load module, grab dmesg output, unload ─────────────────────────────────
+run_module() {
+    local dir="$1" ko="$2"
+    shift 2
+    local mod_path="$KBENCH/$dir/$ko"
+    local mod_name="${ko%.ko}"
+
+    [[ -f "$mod_path" ]] || { log "ERROR: $mod_path not found"; return 1; }
+
+    rmmod "$mod_name" 2>/dev/null || true
+
+    local marker="__bench_${mod_name}_$$"
+    echo "$marker" > /dev/kmsg
+
+    insmod "$mod_path" "$@" || { log "ERROR: insmod failed"; return 1; }
+    rmmod "$mod_name" 2>/dev/null || true
+
+    dmesg | sed -n "/$marker/,\$p" | grep "${mod_name}:" | grep -v "module removed"
 }
 
-# x86 only: RDTSC cycle counter + vmcall helper for baseline measurements.
-# vmcall causes a real VM exit — exactly what the paper's "VM baseline" measures.
-RDTSC_SNIPPET='
-static inline unsigned long long rdtsc(void) {
-    unsigned int lo, hi;
-    __asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
-    return ((unsigned long long)hi << 32) | lo;
-}
-
-/* Issue a single vmcall with hypercall number nr and up to 3 arguments.
-   On stock KVM/QEMU this causes a VM exit; the return value may be -ENOSYS
-   (unknown hypercall) — that is fine, we only care about the round-trip cost. */
-static inline long do_vmcall(long nr, long a1, long a2, long a3) {
-    long ret;
-    __asm__ __volatile__ ("vmcall"
-        : "=a" (ret)
-        : "a" (nr), "b" (a1), "c" (a2), "d" (a3)
-        : "memory");
-    return ret;
-}
-'
-
-# ─── 1. hypercall: raw vmcall round-trip latency ─────────────────────────────
+# ─── Benchmarks ──────────────────────────────────────────────────────────────
 bench_hypercall() {
-    if [[ "$MODE" == "baseline" ]]; then
-        log "=== hypercall [baseline]: KVM_HC_SCHED_YIELD vmcall (kernel-only VM-exit, $ITERS iterations) ==="
-        local bin
-        bin=$(compile_driver_baseline "hypercall" "
-#include <stdio.h>
-#include <stdint.h>
-
-$RDTSC_SNIPPET
-
-/* KVM_HC_SCHED_YIELD = 11: handled entirely in KVM kernel, no QEMU user-space exit.
-   This is the paper's \"Hypercall\" baseline: raw vmcall round-trip at kernel depth. */
-#define KVM_HC_SCHED_YIELD 11
-#define ITERS $ITERS
-
-int main(void) {
-    unsigned long long total_cycles = 0;
-    for (int i = 0; i < ITERS; i++) {
-        unsigned long long t0 = rdtsc();
-        do_vmcall(KVM_HC_SCHED_YIELD, 0, 0, 0);
-        unsigned long long t1 = rdtsc();
-        total_cycles += (t1 - t0);
-    }
-    printf(\"hypercall [baseline] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
-    return 0;
-}
-")
-        "$bin" | tee "$RESULTS_DIR/hypercall.txt"
-    else
-        log "=== hypercall [hyperupcall]: vmcall round-trip latency ($ITERS iterations) ==="
-        local BPF_OBJ="$HUC/network/pass/pass.bpf.o"
-        [[ -f "$BPF_OBJ" ]] || { log "ERROR: $BPF_OBJ not found. Run build_hyperupcalls.sh first."; return 1; }
-        local bin
-        bin=$(compile_driver "hypercall" "
-#include <stdio.h>
-#include <stdint.h>
-#include \"hyperupcall.h\"
-
-$RDTSC_SNIPPET
-
-#define ITERS $ITERS
-
-int main(void) {
-    unsigned long long total_cycles = 0;
-    for (int i = 0; i < ITERS; i++) {
-        unsigned long long t0 = rdtsc();
-        long slot = load_hyperupcall(\"$BPF_OBJ\");
-        if (slot < 0) { fprintf(stderr, \"load failed\\n\"); return 1; }
-        unload_hyperupcall(slot);
-        unsigned long long t1 = rdtsc();
-        total_cycles += (t1 - t0);
-    }
-    printf(\"hypercall [hyperupcall] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
-    return 0;
-}
-")
-        "$bin" | tee "$RESULTS_DIR/hypercall.txt"
-    fi
-    log "Results saved to $RESULTS_DIR/hypercall.txt"
+    log "=== hypercall ($ITERS iterations) ==="
+    build_module "hypercall_bench"
+    run_module "hypercall_bench" "hypercall_bench.ko" \
+        "iters=$ITERS" "nr=11" \
+        | tee "$RESULTS_DIR/hypercall.txt"
 }
 
-# ─── 2. devnotify: XDP attach → device notification latency ──────────────────
 bench_devnotify() {
-    if [[ "$MODE" == "baseline" ]]; then
-        log "=== devnotify [baseline]: eventfd write+read device-notification ($ITERS iterations) ==="
-        local bin
-        bin=$(compile_driver_baseline "devnotify" "
-#include <stdio.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <sys/eventfd.h>
-
-$RDTSC_SNIPPET
-
-/* eventfd write+read mirrors the QEMU device-notification path:
-   guest writes to virtio doorbell → QEMU writes to eventfd → backend wakes up.
-   We measure the round-trip (write then drain) to capture notification latency. */
-#define ITERS $ITERS
-
-int main(void) {
-    int efd = eventfd(0, 0);
-    if (efd < 0) { perror(\"eventfd\"); return 1; }
-    unsigned long long total_cycles = 0;
-    uint64_t val = 1;
-    for (int i = 0; i < ITERS; i++) {
-        unsigned long long t0 = rdtsc();
-        (void) write(efd, &val, sizeof(val));
-        (void) read(efd, &val, sizeof(val));
-        unsigned long long t1 = rdtsc();
-        total_cycles += (t1 - t0);
-    }
-    close(efd);
-    printf(\"devnotify [baseline] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
-    return 0;
-}
-")
-        "$bin" | tee "$RESULTS_DIR/devnotify.txt"
-    else
-        log "=== devnotify [hyperupcall]: XDP device-notification latency ($ITERS iterations) ==="
-        local BPF_OBJ="$HUC/network/pass/pass.bpf.o"
-        [[ -f "$BPF_OBJ" ]] || { log "ERROR: $BPF_OBJ not found. Run build_hyperupcalls.sh first."; return 1; }
-        local bin
-        bin=$(compile_driver "devnotify" "
-#include <stdio.h>
-#include <stdint.h>
-#include \"hyperupcall.h\"
-
-$RDTSC_SNIPPET
-
-#define ITERS   $ITERS
-#define NETDEV  $NETDEV
-
-int main(void) {
-    unsigned long long total_cycles = 0;
-    long slot = load_hyperupcall(\"$BPF_OBJ\");
-    if (slot < 0) { fprintf(stderr, \"load failed\\n\"); return 1; }
-
-    for (int i = 0; i < ITERS; i++) {
-        unsigned long long t0 = rdtsc();
-        long prog = link_hyperupcall(slot, \"xdp_pass\", HYPERUPCALL_MAJORID_XDP, NETDEV);
-        if (prog < 0) { fprintf(stderr, \"link failed\\n\"); return 1; }
-        unlink_hyperupcall(slot, prog);
-        unsigned long long t1 = rdtsc();
-        total_cycles += (t1 - t0);
-    }
-    unload_hyperupcall(slot);
-    printf(\"devnotify [hyperupcall] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
-    return 0;
-}
-")
-        "$bin" | tee "$RESULTS_DIR/devnotify.txt"
-    fi
-    log "Results saved to $RESULTS_DIR/devnotify.txt"
+    log "=== devnotify ($ITERS iterations) ==="
+    build_module "devnotify_bench"
+    run_module "devnotify_bench" "devnotify_bench.ko" \
+        "iters=$ITERS" \
+        | tee "$RESULTS_DIR/devnotify.txt"
 }
 
-# ─── 3. sendipi: perf-event hyperupcall → IPI delivery latency ───────────────
 bench_sendipi() {
-    if [[ "$MODE" == "baseline" ]]; then
-        log "=== sendipi [baseline]: vmcall#15 IPI-request VM-exit round-trip ($ITERS iterations) ==="
-        local bin
-        bin=$(compile_driver_baseline "sendipi" "
-#include <stdio.h>
-#include <stdint.h>
-
-$RDTSC_SNIPPET
-
-/* In the paper's VM baseline, SendIPI is a vmcall asking the hypervisor to
-   deliver an IPI to another CPU.  We issue the same vmcall#15 (hyperupcall
-   link/perf path) so the VM exit depth matches the paper's traditional path.
-   vmcall(15) measured ~3,609 cycles — close to paper's 3,273 cycles. */
-#define ITERS $ITERS
-
-int main(void) {
-    unsigned long long total_cycles = 0;
-    for (int i = 0; i < ITERS; i++) {
-        unsigned long long t0 = rdtsc();
-        do_vmcall(15, 0, 1, 1);
-        unsigned long long t1 = rdtsc();
-        total_cycles += (t1 - t0);
-    }
-    printf(\"sendipi [baseline] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
-    return 0;
-}
-")
-        "$bin" | tee "$RESULTS_DIR/sendipi.txt"
-    else
-        log "=== sendipi [hyperupcall]: perf-event IPI latency ($ITERS iterations) ==="
-        local BPF_OBJ="$HUC/tracing/perf_top.bpf.o"
-        [[ -f "$BPF_OBJ" ]] || { log "ERROR: $BPF_OBJ not found. Run build_hyperupcalls.sh first."; return 1; }
-        local bin
-        bin=$(compile_driver "sendipi" "
-#include <stdio.h>
-#include <stdint.h>
-#include \"hyperupcall.h\"
-
-$RDTSC_SNIPPET
-
-#define ITERS $ITERS
-#define FREQ  1
-
-int main(void) {
-    unsigned long long total_cycles = 0;
-    long slot = load_hyperupcall(\"$BPF_OBJ\");
-    if (slot < 0) { fprintf(stderr, \"load failed\\n\"); return 1; }
-
-    for (int i = 0; i < ITERS; i++) {
-        unsigned long long t0 = rdtsc();
-        long prog = link_hyperupcall(slot, \"perf_top\", HYPERUPCALL_MAJORID_PROFILING, FREQ);
-        if (prog < 0) { fprintf(stderr, \"link failed\\n\"); return 1; }
-        unlink_hyperupcall(slot, prog);
-        unsigned long long t1 = rdtsc();
-        total_cycles += (t1 - t0);
-    }
-    unload_hyperupcall(slot);
-    printf(\"sendipi [hyperupcall] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
-    return 0;
-}
-")
-        "$bin" | tee "$RESULTS_DIR/sendipi.txt"
-    fi
-    log "Results saved to $RESULTS_DIR/sendipi.txt"
+    log "=== sendipi ($ITERS iterations, target_cpu=$TARGET_CPU) ==="
+    build_module "ipi_bench"
+    run_module "ipi_bench" "ipi_bench.ko" \
+        "iters=$ITERS" "target_cpu=$TARGET_CPU" \
+        | tee "$RESULTS_DIR/sendipi.txt"
 }
 
-# ─── 4. ProgramTimer: cost of programming one perf-event timer ───────────────
-# Same loop structure as the other three: ITERS iterations, one operation per
-# iteration, t0/t1 around just that operation, avg cycles output.
-# baseline:    do_vmcall(19) per iter  — raw vmcall#19 VM-exit round-trip
-# hyperupcall: link_hyperupcall(perf_top, SAMPLE_FREQ) + unlink per iter
 bench_program_timer() {
-    if [[ "$MODE" == "baseline" ]]; then
-        log "=== ProgramTimer [baseline]: vmcall#19 timer-request VM-exit round-trip ($ITERS iterations) ==="
-        local bin
-        bin=$(compile_driver_baseline "program_timer" "
-#include <stdio.h>
-#include <stdint.h>
-
-$RDTSC_SNIPPET
-
-/* In the paper's VM baseline, ProgramTimer is a vmcall asking the hypervisor
-   to program a hardware perf counter on behalf of the guest (analogous to
-   writing to PMU MSRs via VM exits).  The guest-side cost is just the vmcall
-   round-trip — the hypervisor does the actual MSR writes.
-   vmcall#19 is the hyperupcall map-elem path; using it here gives the same
-   VM-exit depth as the paper's traditional timer-programming path. */
-#define ITERS       $ITERS
-#define SAMPLE_FREQ $SAMPLE_FREQ
-
-int main(void) {
-    unsigned long long total_cycles = 0;
-    for (int i = 0; i < ITERS; i++) {
-        unsigned long long t0 = rdtsc();
-        do_vmcall(19, 0, SAMPLE_FREQ, 0);
-        unsigned long long t1 = rdtsc();
-        total_cycles += (t1 - t0);
-    }
-    printf(\"ProgramTimer [baseline] avg latency: %llu cycles\\n\",
-           (unsigned long long)(total_cycles / ITERS));
-    return 0;
-}
-")
-        "$bin" | tee "$RESULTS_DIR/program_timer.txt"
-    else
-        log "=== ProgramTimer [hyperupcall]: perf-event timer link+unlink latency ($ITERS iterations) ==="
-        local BPF_OBJ="$HUC/tracing/perf_top.bpf.o"
-        [[ -f "$BPF_OBJ" ]] || { log "ERROR: $BPF_OBJ not found. Run build_hyperupcalls.sh first."; return 1; }
-        local bin
-        bin=$(compile_driver "program_timer" "
-#include <stdio.h>
-#include <stdint.h>
-#include \"hyperupcall.h\"
-
-$RDTSC_SNIPPET
-
-#define ITERS       $ITERS
-#define SAMPLE_FREQ $SAMPLE_FREQ
-
-int main(void) {
-    long slot = load_hyperupcall(\"$BPF_OBJ\");
-    if (slot < 0) { fprintf(stderr, \"load failed\\n\"); return 1; }
-
-    unsigned long long total_cycles = 0;
-    for (int i = 0; i < ITERS; i++) {
-        unsigned long long t0 = rdtsc();
-        long prog = link_hyperupcall(slot, \"perf_top\",
-                                     HYPERUPCALL_MAJORID_PROFILING, SAMPLE_FREQ);
-        if (prog < 0) { fprintf(stderr, \"link failed\\n\"); return 1; }
-        unlink_hyperupcall(slot, prog);
-        unsigned long long t1 = rdtsc();
-        total_cycles += (t1 - t0);
-    }
-    unload_hyperupcall(slot);
-    printf(\"ProgramTimer [hyperupcall] avg latency: %llu cycles\\n\",
-           (unsigned long long)(total_cycles / ITERS));
-    return 0;
-}
-")
-        "$bin" | tee "$RESULTS_DIR/program_timer.txt"
-    fi
-    log "Results saved to $RESULTS_DIR/program_timer.txt"
+    log "=== program_timer ($ITERS iterations, period_ns=$PERIOD_NS) ==="
+    build_module "timer_bench"
+    run_module "timer_bench" "timer_bench.ko" \
+        "iters=$ITERS" "period_ns=$PERIOD_NS" \
+        | tee "$RESULTS_DIR/program_timer.txt"
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dispatcher
-# ─────────────────────────────────────────────────────────────────────────────
-log "Mode: $MODE — Results directory: $RESULTS_DIR"
+# ─── Dispatch ────────────────────────────────────────────────────────────────
+log "Results directory: $RESULTS_DIR"
 
 case "$BENCH" in
-    hypercall)    bench_hypercall ;;
-    devnotify)    bench_devnotify ;;
-    sendipi)      bench_sendipi ;;
-    ProgramTimer) bench_program_timer ;;
+    program_timer|programtimer|ProgramTimer) BENCH="program_timer" ;;
+esac
+
+case "$BENCH" in
+    hypercall)     bench_hypercall ;;
+    devnotify)     bench_devnotify ;;
+    sendipi)       bench_sendipi ;;
+    program_timer) bench_program_timer ;;
     all)
         bench_hypercall
         bench_devnotify
         bench_sendipi
         bench_program_timer
         log ""
-        log "All benchmarks complete [$MODE]. Results in: $RESULTS_DIR"
+        log "All benchmarks complete. Results in: $RESULTS_DIR"
         ;;
     *)
-        echo "Usage: $0 [all|hypercall|devnotify|sendipi|ProgramTimer]"
-        echo "  MODE=baseline|hyperupcall  (default: baseline)"
-        echo "  ITERS=$ITERS  NETDEV=$NETDEV  SAMPLE_FREQ=$SAMPLE_FREQ"
+        echo "Usage: $0 [all|hypercall|devnotify|sendipi|program_timer]"
+        echo "  ITERS=$ITERS  TARGET_CPU=$TARGET_CPU  PERIOD_NS=$PERIOD_NS"
         exit 1
         ;;
 esac

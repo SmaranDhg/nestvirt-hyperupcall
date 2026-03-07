@@ -1,1 +1,0 @@
-sendipi [baseline] avg latency: 1255 cycles
