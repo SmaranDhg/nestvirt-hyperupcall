@@ -5,6 +5,7 @@
 #   sudo ./scripts/run_benchmarks.sh [all|hypercall|devnotify|sendipi|program_timer]
 #   sudo ITERS=10000 ./scripts/run_benchmarks.sh all
 #   sudo TARGET_CPU=2 ./scripts/run_benchmarks.sh sendipi
+#   sudo MMIO_BASE=0xFEBD4000 ./scripts/run_benchmarks.sh devnotify
 
 set -euo pipefail
 
@@ -14,6 +15,7 @@ KBENCH="$REPO_ROOT/kernel_benchmarks"
 ITERS="${ITERS:-1000}"
 TARGET_CPU="${TARGET_CPU:-1}"
 PERIOD_NS="${PERIOD_NS:-1000000}"
+MMIO_BASE="${MMIO_BASE:-}"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/$(date +%Y%m%d_%H%M%S)}"
 BENCH="${1:-all}"
 
@@ -58,10 +60,16 @@ bench_hypercall() {
 }
 
 bench_devnotify() {
-    log "=== devnotify ($ITERS iterations, target_cpu=$TARGET_CPU) ==="
+    if [[ -z "$MMIO_BASE" ]]; then
+        log "ERROR: MMIO_BASE is required for devnotify."
+        log "  Find one with: lspci -v | grep 'Memory at'"
+        log "  Example: sudo MMIO_BASE=0xFEBD4000 $0 devnotify"
+        return 1
+    fi
+    log "=== devnotify ($ITERS iterations, mmio_base=$MMIO_BASE) ==="
     build_module "devnotify_bench"
     run_module "devnotify_bench" "devnotify_bench.ko" \
-        "iters=$ITERS" "target_cpu=$TARGET_CPU" \
+        "iters=$ITERS" "mmio_base=$MMIO_BASE" \
         | tee "$RESULTS_DIR/devnotify.txt"
 }
 
@@ -103,7 +111,7 @@ case "$BENCH" in
         ;;
     *)
         echo "Usage: $0 [all|hypercall|devnotify|sendipi|program_timer]"
-        echo "  ITERS=$ITERS  TARGET_CPU=$TARGET_CPU  PERIOD_NS=$PERIOD_NS"
+        echo "  ITERS=$ITERS  TARGET_CPU=$TARGET_CPU  PERIOD_NS=$PERIOD_NS  MMIO_BASE=0x..."
         exit 1
         ;;
 esac
