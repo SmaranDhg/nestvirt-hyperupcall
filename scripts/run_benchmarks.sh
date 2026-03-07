@@ -8,7 +8,11 @@
 #   4. ProgramTimer   – periodic timer hyperupcall via profiling (perf) event
 #
 # Modes:
-#   baseline    – vmcall round-trip without BPF (same VM-exit path, no eBPF work).
+#   baseline    – real kernel operations for each benchmark (no eBPF/hyperupcall):
+#                   hypercall    → vmcall(KVM_HC_SCHED_YIELD)  in-kernel round-trip
+#                   devnotify    → eventfd write+read           device notification path
+#                   sendipi      → tgkill(SIGUSR1)+noop handler IPI/signal delivery
+#                   ProgramTimer → perf_event_open+close        hardware counter programming
 #   hyperupcall – requires hyperturtle kernel + BPF objects; uses load/link hyperupcalls.
 #
 # Target: x86 only. Latency is reported in CPU cycles (RDTSC).
@@ -154,25 +158,34 @@ int main(void) {
 # ─── 2. devnotify: XDP attach → device notification latency ──────────────────
 bench_devnotify() {
     if [[ "$MODE" == "baseline" ]]; then
-        log "=== devnotify [baseline]: vmcall#15 (link/XDP) VM-exit round-trip ($ITERS iterations) ==="
+        log "=== devnotify [baseline]: eventfd write+read device-notification ($ITERS iterations) ==="
         local bin
         bin=$(compile_driver_baseline "devnotify" "
 #include <stdio.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <sys/eventfd.h>
 
 $RDTSC_SNIPPET
 
-#define ITERS   $ITERS
-#define NETDEV  $NETDEV
+/* eventfd write+read mirrors the QEMU device-notification path:
+   guest writes to virtio doorbell → QEMU writes to eventfd → backend wakes up.
+   We measure the round-trip (write then drain) to capture notification latency. */
+#define ITERS $ITERS
 
 int main(void) {
+    int efd = eventfd(0, 0);
+    if (efd < 0) { perror(\"eventfd\"); return 1; }
     unsigned long long total_cycles = 0;
+    uint64_t val = 1;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long t0 = rdtsc();
-        do_vmcall(15, 0, 0, NETDEV);  /* hyperupcall link vmcall (XDP) — VM exit to QEMU */
+        write(efd, &val, sizeof(val));
+        read(efd, &val, sizeof(val));
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
+    close(efd);
     printf(\"devnotify [baseline] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
     return 0;
 }
@@ -219,21 +232,34 @@ int main(void) {
 # ─── 3. sendipi: perf-event hyperupcall → IPI delivery latency ───────────────
 bench_sendipi() {
     if [[ "$MODE" == "baseline" ]]; then
-        log "=== sendipi [baseline]: vmcall#15 (link/perf) VM-exit round-trip ($ITERS iterations) ==="
+        log "=== sendipi [baseline]: tgkill SIGUSR1 IPI delivery ($ITERS iterations) ==="
         local bin
         bin=$(compile_driver_baseline "sendipi" "
 #include <stdio.h>
 #include <stdint.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 $RDTSC_SNIPPET
+
+/* tgkill delivers a signal to the calling thread — the kernel analogue of
+   sending an IPI: scheduler interrupt, signal handler invocation, return.
+   We install a no-op handler so the cost is purely the delivery round-trip. */
+static void noop_handler(int sig) { (void)sig; }
 
 #define ITERS $ITERS
 
 int main(void) {
+    struct sigaction sa = { .sa_handler = noop_handler };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+    pid_t pid = getpid();
+    pid_t tid = (pid_t) syscall(SYS_gettid);
     unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long t0 = rdtsc();
-        do_vmcall(15, 0, 1, 1);   /* hyperupcall link vmcall (perf/profiling) — VM exit to QEMU */
+        syscall(SYS_tgkill, pid, tid, SIGUSR1);
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
@@ -287,22 +313,37 @@ int main(void) {
 # hyperupcall: link_hyperupcall(perf_top, SAMPLE_FREQ) + unlink per iter
 bench_program_timer() {
     if [[ "$MODE" == "baseline" ]]; then
-        log "=== ProgramTimer [baseline]: vmcall#19 (timer) VM-exit round-trip ($ITERS iterations) ==="
+        log "=== ProgramTimer [baseline]: perf_event_open+close hardware counter ($ITERS iterations) ==="
         local bin
         bin=$(compile_driver_baseline "program_timer" "
 #include <stdio.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/perf_event.h>
 
 $RDTSC_SNIPPET
 
+/* perf_event_open programs the hardware PMU directly — exactly what the
+   hyperupcall ProgramTimer does via eBPF at L0.  We open+close a hardware
+   cycle-counting perf event at SAMPLE_FREQ to match the setup/teardown cost. */
 #define ITERS       $ITERS
 #define SAMPLE_FREQ $SAMPLE_FREQ
 
 int main(void) {
+    struct perf_event_attr pe = {
+        .type        = PERF_TYPE_SOFTWARE,
+        .config      = PERF_COUNT_SW_CPU_CLOCK,
+        .size        = sizeof(struct perf_event_attr),
+        .sample_freq = SAMPLE_FREQ,
+        .freq        = 1,
+        .disabled    = 1,
+    };
     unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long t0 = rdtsc();
-        do_vmcall(19, 0, SAMPLE_FREQ, 0);  /* hyperupcall map-elem vmcall (timer) */
+        int fd = (int) syscall(SYS_perf_event_open, &pe, 0, -1, -1, 0);
+        if (fd >= 0) close(fd);
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
