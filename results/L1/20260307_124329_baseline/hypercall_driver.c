@@ -11,7 +11,7 @@ static inline unsigned long long rdtsc(void) {
 }
 
 
-#define ITERS 50
+#define ITERS 1000
 
 int main(void) {
     unsigned long long total_cycles = 0;
@@ -21,7 +21,7 @@ int main(void) {
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
-    printf("hypercall [baseline] avg latency: %llu cycles\n", (unsigned long long)(total_cycles / ITERS));
+    printf("hypercall [baseline] avg latency: %llu %s\n", (unsigned long long)(total_cycles / ITERS), "cycles");
     return 0;
 }
 

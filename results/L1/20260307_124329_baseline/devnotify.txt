@@ -1,0 +1,1 @@
+devnotify [baseline] avg latency: 18780 cycles

@@ -1,1 +1,0 @@
-devnotify [baseline] avg latency: 2340 ns

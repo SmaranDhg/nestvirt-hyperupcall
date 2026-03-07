@@ -1,1 +1,0 @@
-hypercall [baseline] avg latency: 20 ns

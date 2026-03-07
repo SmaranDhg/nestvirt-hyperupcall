@@ -1,2 +1,2 @@
 ProgramTimer [baseline]: 5000 getpid() calls (equiv 1000 Hz * 5s)...
-ProgramTimer [baseline]: ran 0 ms, 5000 getpid() calls
+ProgramTimer [baseline]: total 11064855 cycles, avg 2118 cycles/call
