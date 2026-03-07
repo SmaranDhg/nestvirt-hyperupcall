@@ -260,6 +260,8 @@ static bool  l2_slot_used[MAX_L2_HYPERUPCALL_OBJS];
 static pthread_mutex_t l2_hyperupcalls_lock;
 static int   l2_hyperupcalls_initialized = 0;
 
+void hyperupcall_l2_teardown(void);
+
 /* ------------------------------------------------------------------ */
 /* Helpers: L1 physical address lookup via /proc/self/pagemap          */
 /* ------------------------------------------------------------------ */
@@ -283,7 +285,7 @@ static uintptr_t hyperupcall_proxy_get_l1_phys(void *vaddr)
     if (!(pfn & (1ULL << 63)))   /* page not present */
         return 0;
     pfn &= 0x7FFFFFFFFFFFFFULL;
-    return (pfn << PAGE_SHIFT) | ((uintptr_t)vaddr & (PAGE_SIZE - 1));
+    return (pfn << 12) | ((uintptr_t)vaddr & (PAGE_SIZE - 1));
 }
 
 /* Allocate a pinned anonymous page (MAP_POPULATE forces physical backing). */
@@ -1994,7 +1996,6 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
     ram_start_offset = memory_region_get_ram_addr(mr) + mr_offset;
 
     kvm_slots_lock();
-    int i = 0;
 
     if (!add) {
         do {
