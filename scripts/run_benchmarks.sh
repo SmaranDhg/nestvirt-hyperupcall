@@ -29,7 +29,7 @@ ITERS="${ITERS:-1000}"          # number of iterations per benchmark
 NETDEV="${NETDEV:-2}"           # guest virtio-net interface index for XDP/TC
 SAMPLE_FREQ="${SAMPLE_FREQ:-1000}"  # Hz for ProgramTimer / profiling benchmark
 MODE="${MODE:-baseline}"        # baseline | hyperupcall
-RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/L1/$(date +%Y%m%d_%H%M%S)_$MODE}"
+RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/$(date +%Y%m%d_%H%M%S)_$MODE}"
 
 BENCH="${1:-all}"
 
