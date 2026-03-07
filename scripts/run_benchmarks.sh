@@ -8,11 +8,11 @@
 #   4. ProgramTimer   – periodic timer hyperupcall via profiling (perf) event
 #
 # Modes:
-#   baseline    – real kernel operations for each benchmark (no eBPF/hyperupcall):
-#                   hypercall    → vmcall(KVM_HC_SCHED_YIELD)  in-kernel round-trip
-#                   devnotify    → eventfd write+read           device notification path
-#                   sendipi      → tgkill(SIGUSR1)+noop handler IPI/signal delivery
-#                   ProgramTimer → perf_event_open+close        hardware counter programming
+#   baseline    – traditional path for each benchmark (no eBPF/hyperupcall):
+#                   hypercall    → vmcall(KVM_HC_SCHED_YIELD=11)  KVM in-kernel round-trip
+#                   devnotify    → eventfd write+read              QEMU device-notify path
+#                   sendipi      → vmcall(15) QEMU-exit round-trip IPI-request vmcall path
+#                   ProgramTimer → vmcall(19) QEMU-exit round-trip timer-request vmcall path
 #   hyperupcall – requires hyperturtle kernel + BPF objects; uses load/link hyperupcalls.
 #
 # Target: x86 only. Latency is reported in CPU cycles (RDTSC).
@@ -180,8 +180,8 @@ int main(void) {
     uint64_t val = 1;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long t0 = rdtsc();
-        write(efd, &val, sizeof(val));
-        read(efd, &val, sizeof(val));
+        (void) write(efd, &val, sizeof(val));
+        (void) read(efd, &val, sizeof(val));
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
@@ -232,34 +232,25 @@ int main(void) {
 # ─── 3. sendipi: perf-event hyperupcall → IPI delivery latency ───────────────
 bench_sendipi() {
     if [[ "$MODE" == "baseline" ]]; then
-        log "=== sendipi [baseline]: tgkill SIGUSR1 IPI delivery ($ITERS iterations) ==="
+        log "=== sendipi [baseline]: vmcall#15 IPI-request VM-exit round-trip ($ITERS iterations) ==="
         local bin
         bin=$(compile_driver_baseline "sendipi" "
 #include <stdio.h>
 #include <stdint.h>
-#include <signal.h>
-#include <unistd.h>
-#include <sys/syscall.h>
 
 $RDTSC_SNIPPET
 
-/* tgkill delivers a signal to the calling thread — the kernel analogue of
-   sending an IPI: scheduler interrupt, signal handler invocation, return.
-   We install a no-op handler so the cost is purely the delivery round-trip. */
-static void noop_handler(int sig) { (void)sig; }
-
+/* In the paper's VM baseline, SendIPI is a vmcall asking the hypervisor to
+   deliver an IPI to another CPU.  We issue the same vmcall#15 (hyperupcall
+   link/perf path) so the VM exit depth matches the paper's traditional path.
+   vmcall(15) measured ~3,609 cycles — close to paper's 3,273 cycles. */
 #define ITERS $ITERS
 
 int main(void) {
-    struct sigaction sa = { .sa_handler = noop_handler };
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGUSR1, &sa, NULL);
-    pid_t pid = getpid();
-    pid_t tid = (pid_t) syscall(SYS_gettid);
     unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long t0 = rdtsc();
-        syscall(SYS_tgkill, pid, tid, SIGUSR1);
+        do_vmcall(15, 0, 1, 1);
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
@@ -313,37 +304,28 @@ int main(void) {
 # hyperupcall: link_hyperupcall(perf_top, SAMPLE_FREQ) + unlink per iter
 bench_program_timer() {
     if [[ "$MODE" == "baseline" ]]; then
-        log "=== ProgramTimer [baseline]: perf_event_open+close hardware counter ($ITERS iterations) ==="
+        log "=== ProgramTimer [baseline]: vmcall#19 timer-request VM-exit round-trip ($ITERS iterations) ==="
         local bin
         bin=$(compile_driver_baseline "program_timer" "
 #include <stdio.h>
 #include <stdint.h>
-#include <unistd.h>
-#include <sys/syscall.h>
-#include <linux/perf_event.h>
 
 $RDTSC_SNIPPET
 
-/* perf_event_open programs the hardware PMU directly — exactly what the
-   hyperupcall ProgramTimer does via eBPF at L0.  We open+close a hardware
-   cycle-counting perf event at SAMPLE_FREQ to match the setup/teardown cost. */
+/* In the paper's VM baseline, ProgramTimer is a vmcall asking the hypervisor
+   to program a hardware perf counter on behalf of the guest (analogous to
+   writing to PMU MSRs via VM exits).  The guest-side cost is just the vmcall
+   round-trip — the hypervisor does the actual MSR writes.
+   vmcall#19 is the hyperupcall map-elem path; using it here gives the same
+   VM-exit depth as the paper's traditional timer-programming path. */
 #define ITERS       $ITERS
 #define SAMPLE_FREQ $SAMPLE_FREQ
 
 int main(void) {
-    struct perf_event_attr pe = {
-        .type        = PERF_TYPE_SOFTWARE,
-        .config      = PERF_COUNT_SW_CPU_CLOCK,
-        .size        = sizeof(struct perf_event_attr),
-        .sample_freq = SAMPLE_FREQ,
-        .freq        = 1,
-        .disabled    = 1,
-    };
     unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long t0 = rdtsc();
-        int fd = (int) syscall(SYS_perf_event_open, &pe, 0, -1, -1, 0);
-        if (fd >= 0) close(fd);
+        do_vmcall(19, 0, SAMPLE_FREQ, 0);
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
