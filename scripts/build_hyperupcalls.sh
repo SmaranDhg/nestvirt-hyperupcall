@@ -29,19 +29,14 @@ if ! command -v clang &>/dev/null; then
     sudo apt-get install -y clang llvm linux-headers-"$(uname -r)"
 fi
 
-# ─── Build each hyperupcall program ───────────────────────────────────────────
+# ─── Build each hyperupcall program (only those needed for benchmarks) ────────
 build_target() {
     local dir="$1"
     log "Building $dir ..."
     make -C "$HUC/$dir" V=1
 }
 
-build_target "ept_fault"
 build_target "network/pass"
-build_target "network/packet_filter"
-build_target "network/packet_counter"
-build_target "network/rate_limiter"
-build_target "network/tcp_top"
 build_target "tracing"
 
 log ""

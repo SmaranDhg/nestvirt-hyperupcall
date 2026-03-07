@@ -57,14 +57,13 @@ nestvirt-hyperupcall/
 │
 ├── scripts/
 │   ├── launch_l1.sh                    # start L1 VM (parameterised QEMU command)
-│   ├── build_hyperupcalls.sh           # build all eBPF/guest programs (run in L1)
+│   ├── build_hyperupcalls.sh           # build eBPF programs for benchmarks (run in L1)
 │   └── run_benchmarks.sh               # four micro-benchmarks (run in L2)
 │
 ├── hyperupcalls/                       # guest-side library (unchanged from HyperTurtle)
 │   ├── hyperupcall.c / hyperupcall.h   # vmcall ABI — used by L1 and L2 identically
-│   ├── ept_fault/
-│   ├── network/  (pass, packet_filter, packet_counter, rate_limiter, tcp_top)
-│   └── tracing/
+│   ├── network/pass/                   # XDP/TC pass-through (for hypercall, devnotify benchmarks)
+│   └── tracing/                        # perf_top (for sendipi, ProgramTimer benchmarks)
 │
 ├── hyperturtle-linux/                  # kernel modifications (patch files)
 │   ├── src/                            # ← full kernel tree (git submodule)
