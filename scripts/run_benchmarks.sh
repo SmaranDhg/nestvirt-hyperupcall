@@ -67,7 +67,7 @@ compile_driver_baseline() {
     cat > "$src" << EOF
 $2
 EOF
-    gcc -O2 -o "$bin" "$src"
+    gcc -O2 -Wno-unused-result -o "$bin" "$src"
     echo "$bin"
 }
 
