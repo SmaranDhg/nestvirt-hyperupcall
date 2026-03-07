@@ -21,6 +21,15 @@
 #include <linux/bpf.h>
 #include <linux/perf_event.h>
 #include <bpf/libbpf.h>
+/* Compatibility: older libbpf may not define these macros. */
+#ifndef LIBBPF_OPTS
+#define LIBBPF_OPTS(type, name, ...) \
+	struct type name = { .sz = sizeof(struct type), ## __VA_ARGS__ }
+#endif
+#ifndef DECLARE_LIBBPF_OPTS
+#define DECLARE_LIBBPF_OPTS(type, name, ...) \
+	struct type name = { .sz = sizeof(struct type), ## __VA_ARGS__ }
+#endif
 #include <linux/hw_breakpoint.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -2022,7 +2031,6 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
             mem->memory_size = 0;
             mem->flags = 0;
             if (mem->slot < HYPERUPCALL_MAX_N_MEMSLOTS && memslot_npages_local[mem->slot] != 0 && mem->as_id == 0) {
-                fprintf(stderr, "delete: i: %d mem->slot: %d slot_size: %lx start_addr: %lx ram: %p \n", i++, mem->slot, slot_size, start_addr, ram);
                 memslot_as_id[mem->slot] = 0;
                 memslot_npages_local[mem->slot] = 0;
                 memslot_base_gfns_local[mem->slot] = 0;
@@ -2054,16 +2062,16 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
         mem->ram = ram;
         mem->flags = kvm_mem_flags(mr);
         kvm_slot_init_dirty_bitmap(mem);
-        if (mem != NULL && mem->slot < HYPERUPCALL_MAX_N_MEMSLOTS && mem->as_id == 0) {
-            fprintf(stderr, "create: i: %d, mem->slot: %d slot_size: %lx start_addr: %lx ram: %p \n", i++, mem->slot, slot_size, start_addr, ram);
+        if (mem->slot >= HYPERUPCALL_MAX_N_MEMSLOTS) {
+            fprintf(stderr, "kvm_set_phys_mem: mem->slot %d exceeds HYPERUPCALL_MAX_N_MEMSLOTS %d\n",
+                    mem->slot, HYPERUPCALL_MAX_N_MEMSLOTS);
+        }
+        else if (mem->as_id == 0) {
+            /* Only track slots for as_id 0 (primary guest RAM) for hyperupcall bypass. */
             memslot_as_id[mem->slot] = kml->as_id;
             memslot_npages_local[mem->slot] = (unsigned long long)slot_size >> 12;
             memslot_base_gfns_local[mem->slot] = (unsigned long long)start_addr >> 12;
             memslot_userptrs_local[mem->slot] = (unsigned long long)ram;
-        }
-        else {
-            fprintf(stderr, "kvm_set_phys_mem: mem->slot %d exceeds HYPERUPCALL_MAX_N_MEMSLOTS %d\n",
-                    mem->slot, HYPERUPCALL_MAX_N_MEMSLOTS);
         }
         err = kvm_set_user_memory_region(kml, mem, true);
         if (err) {
