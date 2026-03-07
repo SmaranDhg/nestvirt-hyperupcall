@@ -8,7 +8,7 @@
 #   4. ProgramTimer   – periodic timer hyperupcall via profiling (perf) event
 #
 # Modes:
-#   baseline   – no hyperupcalls; uses syscalls (getpid, socket/close) for same timing structure.
+#   baseline    – vmcall round-trip without BPF (same VM-exit path, no eBPF work).
 #   hyperupcall – requires hyperturtle kernel + BPF objects; uses load/link hyperupcalls.
 #
 # Target: x86 only. Latency is reported in CPU cycles (RDTSC).
@@ -139,7 +139,7 @@ int main(void) {
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
-    printf(\"hypercall [hyperupcall] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
+    printf(\"hypercall [hyperupcall] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
     return 0;
 }
 ")
@@ -204,7 +204,7 @@ int main(void) {
         total_cycles += (t1 - t0);
     }
     unload_hyperupcall(slot);
-    printf(\"devnotify [hyperupcall] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
+    printf(\"devnotify [hyperupcall] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
     return 0;
 }
 ")
@@ -268,7 +268,7 @@ int main(void) {
         total_cycles += (t1 - t0);
     }
     unload_hyperupcall(slot);
-    printf(\"sendipi [hyperupcall] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
+    printf(\"sendipi [hyperupcall] avg latency: %llu cycles\\n\", (unsigned long long)(total_cycles / ITERS));
     return 0;
 }
 ")
@@ -277,10 +277,14 @@ int main(void) {
     log "Results saved to $RESULTS_DIR/sendipi.txt"
 }
 
-# ─── 4. ProgramTimer: periodic profiling hyperupcall timer overhead ───────────
+# ─── 4. ProgramTimer: cost of programming one perf-event timer ───────────────
+# Same loop structure as the other three: ITERS iterations, one operation per
+# iteration, t0/t1 around just that operation, avg cycles output.
+# baseline:    do_vmcall(19) per iter  — raw vmcall#19 VM-exit round-trip
+# hyperupcall: link_hyperupcall(perf_top, SAMPLE_FREQ) + unlink per iter
 bench_program_timer() {
     if [[ "$MODE" == "baseline" ]]; then
-        log "=== ProgramTimer [baseline]: getpid() at ${SAMPLE_FREQ}Hz for 5s ==="
+        log "=== ProgramTimer [baseline]: vmcall#19 (timer) VM-exit round-trip ($ITERS iterations) ==="
         local bin
         bin=$(compile_driver_baseline "program_timer" "
 #include <stdio.h>
@@ -288,65 +292,55 @@ bench_program_timer() {
 
 $RDTSC_SNIPPET
 
+#define ITERS       $ITERS
 #define SAMPLE_FREQ $SAMPLE_FREQ
-#define DURATION_S  5
 
 int main(void) {
-    long long n = (long long)SAMPLE_FREQ * DURATION_S;
-    printf(\"ProgramTimer [baseline]: %lld vmcall#19 (timer) VM-exits (equiv %d Hz * %ds)...\\n\",
-           (long long)n, SAMPLE_FREQ, DURATION_S);
-    unsigned long long sum_cycles = 0;
-    unsigned long long t_start = rdtsc();
-    for (long long i = 0; i < n; i++) {
+    unsigned long long total_cycles = 0;
+    for (int i = 0; i < ITERS; i++) {
         unsigned long long t0 = rdtsc();
-        do_vmcall(19, 0, SAMPLE_FREQ, 0);  /* hyperupcall map vmcall (timer/profiling) */
+        do_vmcall(19, 0, SAMPLE_FREQ, 0);  /* hyperupcall map-elem vmcall (timer) */
         unsigned long long t1 = rdtsc();
-        sum_cycles += (t1 - t0);
+        total_cycles += (t1 - t0);
     }
-    unsigned long long total_cycles = rdtsc() - t_start;
-    printf(\"ProgramTimer [baseline]: total %llu cycles, avg %llu cycles/call\\n\",
-           (unsigned long long)total_cycles, (unsigned long long)(sum_cycles / n));
+    printf(\"ProgramTimer [baseline] avg latency: %llu cycles\\n\",
+           (unsigned long long)(total_cycles / ITERS));
     return 0;
 }
 ")
         "$bin" | tee "$RESULTS_DIR/program_timer.txt"
     else
-        log "=== ProgramTimer [hyperupcall]: profiling hyperupcall @ ${SAMPLE_FREQ}Hz ==="
+        log "=== ProgramTimer [hyperupcall]: perf-event timer link+unlink latency ($ITERS iterations) ==="
         local BPF_OBJ="$HUC/tracing/perf_top.bpf.o"
         [[ -f "$BPF_OBJ" ]] || { log "ERROR: $BPF_OBJ not found. Run build_hyperupcalls.sh first."; return 1; }
         local bin
         bin=$(compile_driver "program_timer" "
 #include <stdio.h>
-#include <unistd.h>
 #include <stdint.h>
 #include \"hyperupcall.h\"
 
 $RDTSC_SNIPPET
 
+#define ITERS       $ITERS
 #define SAMPLE_FREQ $SAMPLE_FREQ
-#define DURATION_S  5
 
 int main(void) {
     long slot = load_hyperupcall(\"$BPF_OBJ\");
     if (slot < 0) { fprintf(stderr, \"load failed\\n\"); return 1; }
 
-    long prog = link_hyperupcall(slot, \"perf_top\",
-                                 HYPERUPCALL_MAJORID_PROFILING, SAMPLE_FREQ);
-    if (prog < 0) { fprintf(stderr, \"link failed\\n\"); return 1; }
-
-    unsigned long long t_start = rdtsc();
-    printf(\"ProgramTimer [hyperupcall]: running @ %d Hz for %d seconds...\\n\",
-           SAMPLE_FREQ, DURATION_S);
-    sleep(DURATION_S);
-    unsigned long long t_end = rdtsc();
-
-    unlink_hyperupcall(slot, prog);
+    unsigned long long total_cycles = 0;
+    for (int i = 0; i < ITERS; i++) {
+        unsigned long long t0 = rdtsc();
+        long prog = link_hyperupcall(slot, \"perf_top\",
+                                     HYPERUPCALL_MAJORID_PROFILING, SAMPLE_FREQ);
+        if (prog < 0) { fprintf(stderr, \"link failed\\n\"); return 1; }
+        unlink_hyperupcall(slot, prog);
+        unsigned long long t1 = rdtsc();
+        total_cycles += (t1 - t0);
+    }
     unload_hyperupcall(slot);
-
-    unsigned long long total_cycles = t_end - t_start;
-    long long expected_events = (long long)SAMPLE_FREQ * DURATION_S;
-    printf(\"ProgramTimer [hyperupcall]: total %llu %s, expected ~%lld BPF invocations\\n\",
-           (unsigned long long)total_cycles, \"cycles\", expected_events);
+    printf(\"ProgramTimer [hyperupcall] avg latency: %llu cycles\\n\",
+           (unsigned long long)(total_cycles / ITERS));
     return 0;
 }
 ")
