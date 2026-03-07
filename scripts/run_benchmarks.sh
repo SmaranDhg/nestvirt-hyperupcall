@@ -58,10 +58,10 @@ bench_hypercall() {
 }
 
 bench_devnotify() {
-    log "=== devnotify ($ITERS iterations) ==="
+    log "=== devnotify ($ITERS iterations, target_cpu=$TARGET_CPU) ==="
     build_module "devnotify_bench"
     run_module "devnotify_bench" "devnotify_bench.ko" \
-        "iters=$ITERS" \
+        "iters=$ITERS" "target_cpu=$TARGET_CPU" \
         | tee "$RESULTS_DIR/devnotify.txt"
 }
 

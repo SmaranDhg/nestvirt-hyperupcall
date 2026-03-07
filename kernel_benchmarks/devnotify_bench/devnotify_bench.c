@@ -12,6 +12,7 @@
 #include <linux/init.h>
 #include <linux/irq_work.h>
 #include <linux/completion.h>
+#include <linux/smp.h>
 #include <asm/msr.h>
 
 static DECLARE_COMPLETION(notify_done);
@@ -30,23 +31,42 @@ static int iters = 1000;
 module_param(iters, int, 0644);
 MODULE_PARM_DESC(iters, "Number of iterations (default 1000)");
 
+static int target_cpu = 1;
+module_param(target_cpu, int, 0644);
+MODULE_PARM_DESC(target_cpu, "Target CPU for notification (default 1); must differ from current CPU");
+
 static int __init devnotify_bench_init(void)
 {
 	unsigned long long start, end, total = 0;
-	int i;
+	int i, cpu_here, cpu;
 
 	if (iters <= 0)
 		iters = 1000;
 
-	pr_info("devnotify_bench: device-notification latency (irq_work), %d iterations\n",
-		iters);
+	cpu_here = get_cpu();
+	put_cpu();
+
+	/* Use target_cpu if online and not current; else pick another. */
+	cpu = target_cpu;
+	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu) || cpu == cpu_here) {
+		for (cpu = 0; cpu < nr_cpu_ids; cpu++)
+			if (cpu_online(cpu) && cpu != cpu_here)
+				break;
+		if (cpu >= nr_cpu_ids) {
+			pr_info("devnotify_bench: need at least 2 online CPUs\n");
+			return -EINVAL;
+		}
+	}
+
+	pr_info("devnotify_bench: device-notification latency (irq_work), CPU %d -> %d, %d iterations\n",
+		cpu_here, cpu, iters);
 
 	for (i = 0; i < iters; i++) {
 		reinit_completion(&notify_done);
 
 		barrier();
 		start = rdtsc_ordered();
-		irq_work_queue(&notify_work);
+		irq_work_queue_on(&notify_work, cpu);
 		wait_for_completion(&notify_done);
 		end = rdtsc_ordered();
 
