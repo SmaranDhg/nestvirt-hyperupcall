@@ -92,7 +92,7 @@ static inline long do_vmcall(long nr, long a1, long a2, long a3) {
 # ─── 1. hypercall: raw vmcall round-trip latency ─────────────────────────────
 bench_hypercall() {
     if [[ "$MODE" == "baseline" ]]; then
-        log "=== hypercall [baseline]: vmcall#13 (load) VM-exit round-trip ($ITERS iterations) ==="
+        log "=== hypercall [baseline]: KVM_HC_SCHED_YIELD vmcall (kernel-only VM-exit, $ITERS iterations) ==="
         local bin
         bin=$(compile_driver_baseline "hypercall" "
 #include <stdio.h>
@@ -100,13 +100,16 @@ bench_hypercall() {
 
 $RDTSC_SNIPPET
 
+/* KVM_HC_SCHED_YIELD = 11: handled entirely in KVM kernel, no QEMU user-space exit.
+   This is the paper's \"Hypercall\" baseline: raw vmcall round-trip at kernel depth. */
+#define KVM_HC_SCHED_YIELD 11
 #define ITERS $ITERS
 
 int main(void) {
     unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long t0 = rdtsc();
-        do_vmcall(13, 0, 0, 0);   /* hyperupcall load vmcall — VM exit to QEMU */
+        do_vmcall(KVM_HC_SCHED_YIELD, 0, 0, 0);
         unsigned long long t1 = rdtsc();
         total_cycles += (t1 - t0);
     }
