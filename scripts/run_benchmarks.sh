@@ -11,6 +11,8 @@
 #   baseline   – no hyperupcalls; uses syscalls (getpid, socket/close) for same timing structure.
 #   hyperupcall – requires hyperturtle kernel + BPF objects; uses load/link hyperupcalls.
 #
+# Target: x86 only. Latency is reported in CPU cycles (RDTSC).
+#
 # Usage:
 #   ./scripts/run_benchmarks.sh [all|hypercall|devnotify|sendipi|ProgramTimer]
 #   MODE=baseline ./scripts/run_benchmarks.sh all    # run baseline first to verify script
@@ -65,6 +67,15 @@ EOF
     echo "$bin"
 }
 
+# x86 only: CPU cycle counter via RDTSC
+RDTSC_SNIPPET='
+static inline unsigned long long rdtsc(void) {
+    unsigned int lo, hi;
+    __asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
+    return ((unsigned long long)hi << 32) | lo;
+}
+'
+
 # ─── 1. hypercall: raw vmcall round-trip latency ─────────────────────────────
 bench_hypercall() {
     if [[ "$MODE" == "baseline" ]]; then
@@ -72,22 +83,22 @@ bench_hypercall() {
         local bin
         bin=$(compile_driver_baseline "hypercall" "
 #include <stdio.h>
-#include <time.h>
 #include <stdint.h>
 #include <unistd.h>
+
+$RDTSC_SNIPPET
 
 #define ITERS $ITERS
 
 int main(void) {
-    struct timespec t0, t1;
-    long long total_ns = 0;
+    unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        unsigned long long t0 = rdtsc();
         (void) getpid();
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        total_ns += (t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec);
+        unsigned long long t1 = rdtsc();
+        total_cycles += (t1 - t0);
     }
-    printf(\"hypercall [baseline] avg latency: %lld ns\\n\", total_ns / ITERS);
+    printf(\"hypercall [baseline] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
     return 0;
 }
 ")
@@ -99,24 +110,24 @@ int main(void) {
         local bin
         bin=$(compile_driver "hypercall" "
 #include <stdio.h>
-#include <time.h>
 #include <stdint.h>
 #include \"hyperupcall.h\"
+
+$RDTSC_SNIPPET
 
 #define ITERS $ITERS
 
 int main(void) {
-    struct timespec t0, t1;
-    long long total_ns = 0;
+    unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        unsigned long long t0 = rdtsc();
         long slot = load_hyperupcall(\"$BPF_OBJ\");
         if (slot < 0) { fprintf(stderr, \"load failed\\n\"); return 1; }
         unload_hyperupcall(slot);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        total_ns += (t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec);
+        unsigned long long t1 = rdtsc();
+        total_cycles += (t1 - t0);
     }
-    printf(\"hypercall [hyperupcall] avg latency: %lld ns\\n\", total_ns / ITERS);
+    printf(\"hypercall [hyperupcall] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
     return 0;
 }
 ")
@@ -132,25 +143,25 @@ bench_devnotify() {
         local bin
         bin=$(compile_driver_baseline "devnotify" "
 #include <stdio.h>
-#include <time.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+$RDTSC_SNIPPET
+
 #define ITERS $ITERS
 
 int main(void) {
-    struct timespec t0, t1;
-    long long total_ns = 0;
+    unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        unsigned long long t0 = rdtsc();
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd >= 0) close(fd);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        total_ns += (t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec);
+        unsigned long long t1 = rdtsc();
+        total_cycles += (t1 - t0);
     }
-    printf(\"devnotify [baseline] avg latency: %lld ns\\n\", total_ns / ITERS);
+    printf(\"devnotify [baseline] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
     return 0;
 }
 ")
@@ -162,29 +173,29 @@ int main(void) {
         local bin
         bin=$(compile_driver "devnotify" "
 #include <stdio.h>
-#include <time.h>
 #include <stdint.h>
 #include \"hyperupcall.h\"
+
+$RDTSC_SNIPPET
 
 #define ITERS   $ITERS
 #define NETDEV  $NETDEV
 
 int main(void) {
-    struct timespec t0, t1;
-    long long total_ns = 0;
+    unsigned long long total_cycles = 0;
     long slot = load_hyperupcall(\"$BPF_OBJ\");
     if (slot < 0) { fprintf(stderr, \"load failed\\n\"); return 1; }
 
     for (int i = 0; i < ITERS; i++) {
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        unsigned long long t0 = rdtsc();
         long prog = link_hyperupcall(slot, \"xdp_pass\", HYPERUPCALL_MAJORID_XDP, NETDEV);
         if (prog < 0) { fprintf(stderr, \"link failed\\n\"); return 1; }
         unlink_hyperupcall(slot, prog);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        total_ns += (t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec);
+        unsigned long long t1 = rdtsc();
+        total_cycles += (t1 - t0);
     }
     unload_hyperupcall(slot);
-    printf(\"devnotify [hyperupcall] avg latency: %lld ns\\n\", total_ns / ITERS);
+    printf(\"devnotify [hyperupcall] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
     return 0;
 }
 ")
@@ -200,22 +211,22 @@ bench_sendipi() {
         local bin
         bin=$(compile_driver_baseline "sendipi" "
 #include <stdio.h>
-#include <time.h>
 #include <stdint.h>
 #include <unistd.h>
+
+$RDTSC_SNIPPET
 
 #define ITERS $ITERS
 
 int main(void) {
-    struct timespec t0, t1;
-    long long total_ns = 0;
+    unsigned long long total_cycles = 0;
     for (int i = 0; i < ITERS; i++) {
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        unsigned long long t0 = rdtsc();
         (void) getpid();
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        total_ns += (t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec);
+        unsigned long long t1 = rdtsc();
+        total_cycles += (t1 - t0);
     }
-    printf(\"sendipi [baseline] avg latency: %lld ns\\n\", total_ns / ITERS);
+    printf(\"sendipi [baseline] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
     return 0;
 }
 ")
@@ -227,29 +238,29 @@ int main(void) {
         local bin
         bin=$(compile_driver "sendipi" "
 #include <stdio.h>
-#include <time.h>
 #include <stdint.h>
 #include \"hyperupcall.h\"
+
+$RDTSC_SNIPPET
 
 #define ITERS $ITERS
 #define FREQ  1
 
 int main(void) {
-    struct timespec t0, t1;
-    long long total_ns = 0;
+    unsigned long long total_cycles = 0;
     long slot = load_hyperupcall(\"$BPF_OBJ\");
     if (slot < 0) { fprintf(stderr, \"load failed\\n\"); return 1; }
 
     for (int i = 0; i < ITERS; i++) {
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        unsigned long long t0 = rdtsc();
         long prog = link_hyperupcall(slot, \"perf_top\", HYPERUPCALL_MAJORID_PROFILING, FREQ);
         if (prog < 0) { fprintf(stderr, \"link failed\\n\"); return 1; }
         unlink_hyperupcall(slot, prog);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        total_ns += (t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec);
+        unsigned long long t1 = rdtsc();
+        total_cycles += (t1 - t0);
     }
     unload_hyperupcall(slot);
-    printf(\"sendipi [hyperupcall] avg latency: %lld ns\\n\", total_ns / ITERS);
+    printf(\"sendipi [hyperupcall] avg latency: %llu %s\\n\", (unsigned long long)(total_cycles / ITERS), \"cycles\");
     return 0;
 }
 ")
@@ -265,26 +276,31 @@ bench_program_timer() {
         local bin
         bin=$(compile_driver_baseline "program_timer" "
 #include <stdio.h>
-#include <time.h>
-#include <unistd.h>
 #include <stdint.h>
+#include <unistd.h>
+
+$RDTSC_SNIPPET
 
 #define SAMPLE_FREQ $SAMPLE_FREQ
 #define DURATION_S  5
 
 int main(void) {
-    struct timespec t0, t1;
+    unsigned long long t_start = rdtsc();
     long long n = (long long)SAMPLE_FREQ * DURATION_S;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
     printf(\"ProgramTimer [baseline]: %lld getpid() calls (equiv %d Hz * %ds)...\\n\",
            (long long)n, SAMPLE_FREQ, DURATION_S);
-    for (long long i = 0; i < n; i++)
+    unsigned long long sum_cycles = 0;
+    for (long long i = 0; i < n; i++) {
+        unsigned long long t0 = rdtsc();
         (void) getpid();
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    long long elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000LL
-                         + (t1.tv_nsec - t0.tv_nsec) / 1000000LL;
-    printf(\"ProgramTimer [baseline]: ran %lld ms, %lld getpid() calls\\n\",
-           elapsed_ms, n);
+        unsigned long long t1 = rdtsc();
+        sum_cycles += (t1 - t0);
+    }
+    unsigned long long t_end = rdtsc();
+    unsigned long long total_cycles = t_end - t_start;
+    printf(\"ProgramTimer [baseline]: total %llu %s, avg %llu %s/call\\n\",
+           (unsigned long long)total_cycles, \"cycles\",
+           (unsigned long long)(sum_cycles / n), \"cycles\");
     return 0;
 }
 ")
@@ -296,16 +312,16 @@ int main(void) {
         local bin
         bin=$(compile_driver "program_timer" "
 #include <stdio.h>
-#include <time.h>
 #include <unistd.h>
 #include <stdint.h>
 #include \"hyperupcall.h\"
+
+$RDTSC_SNIPPET
 
 #define SAMPLE_FREQ $SAMPLE_FREQ
 #define DURATION_S  5
 
 int main(void) {
-    struct timespec t0, t1;
     long slot = load_hyperupcall(\"$BPF_OBJ\");
     if (slot < 0) { fprintf(stderr, \"load failed\\n\"); return 1; }
 
@@ -313,20 +329,19 @@ int main(void) {
                                  HYPERUPCALL_MAJORID_PROFILING, SAMPLE_FREQ);
     if (prog < 0) { fprintf(stderr, \"link failed\\n\"); return 1; }
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    unsigned long long t_start = rdtsc();
     printf(\"ProgramTimer [hyperupcall]: running @ %d Hz for %d seconds...\\n\",
            SAMPLE_FREQ, DURATION_S);
     sleep(DURATION_S);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    unsigned long long t_end = rdtsc();
 
     unlink_hyperupcall(slot, prog);
     unload_hyperupcall(slot);
 
-    long long elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000LL
-                         + (t1.tv_nsec - t0.tv_nsec) / 1000000LL;
+    unsigned long long total_cycles = t_end - t_start;
     long long expected_events = (long long)SAMPLE_FREQ * DURATION_S;
-    printf(\"ProgramTimer [hyperupcall]: ran %lld ms, expected ~%lld BPF invocations\\n\",
-           elapsed_ms, expected_events);
+    printf(\"ProgramTimer [hyperupcall]: total %llu %s, expected ~%lld BPF invocations\\n\",
+           (unsigned long long)total_cycles, \"cycles\", expected_events);
     return 0;
 }
 ")
