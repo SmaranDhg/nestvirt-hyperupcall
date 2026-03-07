@@ -1,61 +1,58 @@
 /*
- * DevNotify benchmark kernel module — measures device-notification latency.
- * Sends an IPI to a target CPU via smp_call_function_single (synchronous),
- * which is the kernel primitive for "notify a remote CPU and wait for ack."
+ * DevNotify benchmark kernel module — measures device-notification latency
+ * via MMIO doorbell write (writel to a mapped device register).
  *
  * Build: make -C /lib/modules/$(uname -r)/build M=$PWD
- * Run:   sudo insmod devnotify_bench.ko [iters=N] [target_cpu=N]; dmesg | tail
+ * Run:   sudo insmod devnotify_bench.ko mmio_base=0xFEBD4000 [iters=N]; dmesg | tail
+ *
+ * To find a real MMIO address (e.g. virtio doorbell):
+ *   lspci -v | grep -A5 "Virtio"    # look for "Memory at ..."
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/smp.h>
+#include <linux/io.h>
 #include <asm/msr.h>
 
-static void notify_handler(void *info)
-{
-	/* Empty — just the IPI delivery + handler invocation is the cost. */
-}
+#define MMIO_SIZE 0x1000
 
-static int target_cpu = 1;
-module_param(target_cpu, int, 0644);
-MODULE_PARM_DESC(target_cpu, "Target CPU for notification (default 1)");
+static unsigned long mmio_base = 0;
+module_param(mmio_base, ulong, 0644);
+MODULE_PARM_DESC(mmio_base, "MMIO base address of device doorbell (REQUIRED)");
 
 static int iters = 1000;
 module_param(iters, int, 0644);
 MODULE_PARM_DESC(iters, "Number of iterations (default 1000)");
 
+static void __iomem *mmio;
+
 static int __init devnotify_bench_init(void)
 {
 	unsigned long long start, end, total = 0;
-	int cpu = target_cpu;
 	int i;
 
-	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu)) {
-		pr_info("devnotify_bench: CPU %d not available\n", cpu);
+	if (!mmio_base) {
+		pr_info("devnotify_bench: mmio_base is required\n");
+		pr_info("  Find one with: lspci -v | grep 'Memory at'\n");
 		return -EINVAL;
-	}
-
-	if (cpu == smp_processor_id()) {
-		for (cpu = 0; cpu < nr_cpu_ids; cpu++)
-			if (cpu_online(cpu) && cpu != smp_processor_id())
-				break;
-		if (cpu >= nr_cpu_ids) {
-			pr_info("devnotify_bench: need at least 2 online CPUs\n");
-			return -EINVAL;
-		}
 	}
 
 	if (iters <= 0)
 		iters = 1000;
 
-	pr_info("devnotify_bench: device-notification, CPU %d -> CPU %d, %d iterations\n",
-		smp_processor_id(), cpu, iters);
+	mmio = ioremap(mmio_base, MMIO_SIZE);
+	if (!mmio) {
+		pr_info("devnotify_bench: failed to ioremap 0x%lx\n", mmio_base);
+		return -ENOMEM;
+	}
+
+	pr_info("devnotify_bench: MMIO doorbell write at 0x%lx, %d iterations\n",
+		mmio_base, iters);
 
 	for (i = 0; i < iters; i++) {
 		barrier();
 		start = rdtsc_ordered();
-		smp_call_function_single(cpu, notify_handler, NULL, 1);
+		writel(1, mmio);
 		end = rdtsc_ordered();
 		total += (end - start);
 	}
@@ -67,6 +64,8 @@ static int __init devnotify_bench_init(void)
 
 static void __exit devnotify_bench_exit(void)
 {
+	if (mmio)
+		iounmap(mmio);
 	pr_info("devnotify_bench: module removed\n");
 }
 
@@ -75,4 +74,4 @@ module_exit(devnotify_bench_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Benchmark");
-MODULE_DESCRIPTION("Device-notification latency benchmark (cross-CPU IPI, cycles)");
+MODULE_DESCRIPTION("Device-notification latency benchmark (MMIO doorbell write, cycles)");
