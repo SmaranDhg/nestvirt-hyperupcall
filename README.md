@@ -32,17 +32,17 @@ qemu-img create -f qcow2 ~/l1.qcow2 60G
 # 6. Inside L1 — build hyperupcall programs
 ./scripts/build_hyperupcalls.sh
 
-# 7. Inside L2 — run the four micro-benchmarks
-./scripts/run_benchmarks.sh all
+# 7. Inside L2 — run the four micro-benchmarks (userspace)
+sudo ./scripts/run_benchmarks.sh all
 ```
 
 Individual benchmark:
 
 ```bash
-./scripts/run_benchmarks.sh hypercall    # vmcall round-trip latency
-./scripts/run_benchmarks.sh devnotify    # XDP attach/detach latency
-./scripts/run_benchmarks.sh sendipi      # perf-event IPI latency
-./scripts/run_benchmarks.sh ProgramTimer # periodic profiling timer overhead
+sudo ./scripts/run_benchmarks.sh hypercall       # vmcall round-trip latency
+sudo ./scripts/run_benchmarks.sh devnotify        # virtio MMIO notification latency
+sudo ./scripts/run_benchmarks.sh sendipi          # cross-CPU IPI latency
+sudo ./scripts/run_benchmarks.sh program_timer    # LAPIC TSC-deadline timer latency
 ```
 
 ---
@@ -55,10 +55,17 @@ nestvirt-hyperupcall/
 ├── SPEC.md                             # nested-virt hyperupcall design spec
 ├── README.md
 │
+├── microbench/                         # userspace microbenchmarks (Table 3, DVH ASPLOS'20)
+│   ├── hypercall.c                     # vmcall round-trip latency
+│   ├── devnotify.c                     # virtio MMIO notification latency
+│   ├── programtimer.c                  # LAPIC TSC-deadline timer latency
+│   ├── sendipi.c                       # cross-CPU IPI latency
+│   └── Makefile
+│
 ├── scripts/
 │   ├── launch_l1.sh                    # start L1 VM (parameterised QEMU command)
 │   ├── build_hyperupcalls.sh           # build eBPF programs for benchmarks (run in L1)
-│   └── run_benchmarks.sh               # four micro-benchmarks (run in L2)
+│   └── run_benchmarks.sh               # build & run microbenchmarks (run in L1/L2/L3)
 │
 ├── hyperupcalls/                       # guest-side library (unchanged from HyperTurtle)
 │   ├── hyperupcall.c / hyperupcall.h   # vmcall ABI — used by L1 and L2 identically
@@ -156,7 +163,7 @@ All runtime parameters are environment variables:
 DISK_IMG=~/l1.qcow2  CPUS=12  MEM=64G  SSH_PORT=2222  TAP_IFACE=tap0
 
 # run_benchmarks.sh
-ITERS=5000  NETDEV=2  SAMPLE_FREQ=1000  RESULTS_DIR=./results/run1
+RESULTS_DIR=./results/run1
 ```
 
 ---
