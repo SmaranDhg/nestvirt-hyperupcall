@@ -14,7 +14,6 @@ KBENCH="$REPO_ROOT/kernel_benchmarks"
 
 ITERS="${ITERS:-1000}"
 TARGET_CPU="${TARGET_CPU:-1}"
-PERIOD_NS="${PERIOD_NS:-1000000}"
 MMIO_BASE="${MMIO_BASE:-}"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/$(date +%Y%m%d_%H%M%S)}"
 BENCH="${1:-all}"
@@ -82,10 +81,10 @@ bench_sendipi() {
 }
 
 bench_program_timer() {
-    log "=== program_timer ($ITERS iterations, period_ns=$PERIOD_NS) ==="
+    log "=== program_timer ($ITERS iterations) ==="
     build_module "timer_bench"
     run_module "timer_bench" "timer_bench.ko" \
-        "iters=$ITERS" "period_ns=$PERIOD_NS" \
+        "iters=$ITERS" \
         | tee "$RESULTS_DIR/program_timer.txt"
 }
 
@@ -111,7 +110,7 @@ case "$BENCH" in
         ;;
     *)
         echo "Usage: $0 [all|hypercall|devnotify|sendipi|program_timer]"
-        echo "  ITERS=$ITERS  TARGET_CPU=$TARGET_CPU  PERIOD_NS=$PERIOD_NS  MMIO_BASE=0x..."
+        echo "  ITERS=$ITERS  TARGET_CPU=$TARGET_CPU  MMIO_BASE=0x..."
         exit 1
         ;;
 esac
