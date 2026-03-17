@@ -118,9 +118,7 @@ build_libbpf() {
 build_qemu() {
     log "Building hyperturtle-qemu..."
     mkdir -p "$QEMU_BUILD"
-    cd "$QEMU_BUILD"
-    ../configure --target-list=x86_64-softmmu
-    make -j"$(nproc)"
+    ../configure --target-list=x86_64-softmmu --extra-ldflags="-lbpf"
     log "QEMU binary: $QEMU_BUILD/qemu-system-x86_64"
     log "Add to PATH or set QEMU env var in scripts/launch_l1.sh."
 }
