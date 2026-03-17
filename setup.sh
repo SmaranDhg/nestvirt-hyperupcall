@@ -36,7 +36,7 @@ install_deps() {
         libbfd-dev pkg-config zlib1g-dev libglib2.0-dev libpixman-1-dev \
         ninja-build python3 python3-pip python3-setuptools \
         libfdt-dev libslirp-dev \
-        dwarves pahole \
+        dwarves \
         curl wget
     log "Dependencies installed."
 }
