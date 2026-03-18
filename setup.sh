@@ -81,7 +81,10 @@ build_kernel() {
     log "Configuring kernel (hyperturtle_defconfig + DWARF4)..."
     cd "$LINUX_SRC"
 
-    make hyperturtle_defconfig
+    # Use the known-working CloudLab host config instead of a minimal defconfig
+    # so we don't drop the bare-metal storage and network drivers!
+    cp /boot/config-$(uname -r) .config
+    make olddefconfig
 
     # Force DWARF4 — newer GCC defaults to DWARFv5 which breaks resolve_btfids
     ./scripts/config --enable  DEBUG_INFO_DWARF4
